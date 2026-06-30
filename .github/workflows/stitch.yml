@@ -1,4 +1,5 @@
 name: Stitch video from Google Drive (by IDs, 256MiB + DNS/hosts)
+run-name: stitch-${{ inputs.output_basename }}-${{ inputs.input_id }}
 
 on:
   workflow_dispatch:
@@ -87,6 +88,17 @@ jobs:
           rclone backend copyid gdrive: "${{ inputs.intro_id }}"  "in/intro"
           rclone backend copyid gdrive: "${{ inputs.outro_id }}"  "in/outro"
 
+      - name: Inspect input durations
+        shell: bash
+        run: |
+          set -e
+          for f in in/intro in/input in/outro; do
+            echo "---- $f ----"
+            ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$f"
+            ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,r_frame_rate -of default=nw=1 "$f" || true
+            ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels -of default=nw=1 "$f" || true
+          done
+
       - name: Probe main video parameters
         id: probe
         shell: bash
@@ -136,18 +148,33 @@ jobs:
             -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2" \
             -r "$FPSR" -c:v "$VLIB" -pix_fmt yuv420p -c:a "$ALIB" -ar "$ASR" -ac "$ACH" outro_t.mp4
 
-      - name: Concat (try -c copy, fallback reencode)
+      - name: Concat always reencode
         shell: bash
         run: |
           set -e
           printf "file 'intro_t.mp4'\nfile 'in/input'\nfile 'outro_t.mp4'\n" > list.txt
-          if ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i list.txt -c copy out.mp4; then
-            echo "Concat with -c copy OK"
-          else
-            echo "Param mismatch; reencoding all"
-            ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i list.txt \
-              -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 128k out.mp4
-          fi
+
+          ffmpeg -hide_banner -y -fflags +genpts -f concat -safe 0 -i list.txt \
+            -c:v libx264 -preset veryfast -crf 20 \
+            -c:a aac -b:a 128k \
+            -movflags +faststart out.mp4
+
+      - name: Validate output video
+        shell: bash
+        run: |
+          set -e
+          test -s out.mp4
+
+          DURATION=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 out.mp4)
+          VIDEO_STREAMS=$(ffprobe -v error -select_streams v -show_entries stream=index -of csv=p=0 out.mp4 | wc -l)
+          AUDIO_STREAMS=$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 out.mp4 | wc -l)
+
+          echo "Output duration: $DURATION seconds"
+          echo "Video streams: $VIDEO_STREAMS"
+          echo "Audio streams: $AUDIO_STREAMS"
+
+          awk "BEGIN { exit !($DURATION > 10) }"
+          test "$VIDEO_STREAMS" -ge 1
 
       - name: Upload output to destination folder by ID (256MiB chunks + backoff)
         shell: bash
