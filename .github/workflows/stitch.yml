@@ -148,15 +148,31 @@ jobs:
             -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2" \
             -r "$FPSR" -c:v "$VLIB" -pix_fmt yuv420p -c:a "$ALIB" -ar "$ASR" -ac "$ACH" outro_t.mp4
 
-      - name: Concat always reencode
+      - name: Concat filter reencode
         shell: bash
         run: |
           set -e
-          printf "file 'intro_t.mp4'\nfile 'in/input'\nfile 'outro_t.mp4'\n" > list.txt
+          WIDTH='${{ steps.probe.outputs.width }}'
+          HEIGHT='${{ steps.probe.outputs.height }}'
+          FPSR='${{ steps.probe.outputs.fpsr }}'
+          ASR='${{ steps.probe.outputs.asr }}'
+          ACH='${{ steps.probe.outputs.ach }}'
 
-          ffmpeg -hide_banner -y -fflags +genpts -f concat -safe 0 -i list.txt \
+          ffmpeg -hide_banner -y \
+            -fflags +genpts -i intro_t.mp4 \
+            -fflags +genpts -i in/input \
+            -fflags +genpts -i outro_t.mp4 \
+            -filter_complex "\
+              [0:v]setpts=PTS-STARTPTS,scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps=${FPSR},format=yuv420p[v0]; \
+              [1:v]setpts=PTS-STARTPTS,scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps=${FPSR},format=yuv420p[v1]; \
+              [2:v]setpts=PTS-STARTPTS,scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps=${FPSR},format=yuv420p[v2]; \
+              [0:a]asetpts=PTS-STARTPTS,aresample=${ASR}:async=1:first_pts=0[a0]; \
+              [1:a]asetpts=PTS-STARTPTS,aresample=${ASR}:async=1:first_pts=0[a1]; \
+              [2:a]asetpts=PTS-STARTPTS,aresample=${ASR}:async=1:first_pts=0[a2]; \
+              [v0][a0][v1][a1][v2][a2]concat=n=3:v=1:a=1[v][a]" \
+            -map "[v]" -map "[a]" \
             -c:v libx264 -preset veryfast -crf 20 \
-            -c:a aac -b:a 128k \
+            -c:a aac -b:a 128k -ar "$ASR" -ac "$ACH" \
             -movflags +faststart out.mp4
 
       - name: Validate output video
