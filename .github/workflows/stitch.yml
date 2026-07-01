@@ -16,6 +16,15 @@ on:
       output_basename:
         description: "Nombre base de salida (sin .mp4)"
         default: "salida"
+      auto_trim:
+        description: "Detectar automaticamente inicio/final reales de la clase con IA"
+        default: "true"
+      trim_start:
+        description: "Override manual de inicio real. Ej: 00:02:35. Vacio = IA o sin recorte"
+        default: ""
+      trim_end:
+        description: "Override manual de final real. Ej: 01:14:20. Vacio = IA o hasta el final"
+        default: ""
 
 jobs:
   stitch:
@@ -98,6 +107,244 @@ jobs:
             ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,r_frame_rate -of default=nw=1 "$f" || true
             ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels -of default=nw=1 "$f" || true
           done
+
+      - name: Auto-detect and trim main video
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AUTO_TRIM: ${{ inputs.auto_trim }}
+          MANUAL_TRIM_START: ${{ inputs.trim_start }}
+          MANUAL_TRIM_END: ${{ inputs.trim_end }}
+        run: |
+          set -e
+
+          DURATION=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 in/input)
+          FINAL_START="$MANUAL_TRIM_START"
+          FINAL_END="$MANUAL_TRIM_END"
+
+          detect_ai_trim () {
+            set -e
+            WINDOW_SECONDS=1800
+            END_OFFSET=$(python3 - "$DURATION" "$WINDOW_SECONDS" <<'PY'
+          import sys
+          duration = float(sys.argv[1])
+          window = float(sys.argv[2])
+          print(max(0, duration - window))
+          PY
+          )
+
+            ffmpeg -hide_banner -loglevel error -y -t "$WINDOW_SECONDS" -i in/input \
+              -vn -ac 1 -ar 16000 -b:a 24k ai_start.mp3
+            ffmpeg -hide_banner -loglevel error -y -ss "$END_OFFSET" -i in/input -t "$WINDOW_SECONDS" \
+              -vn -ac 1 -ar 16000 -b:a 24k ai_end.mp3
+
+            curl -sS --fail https://api.openai.com/v1/audio/transcriptions \
+              -H "Authorization: Bearer $OPENAI_API_KEY" \
+              -H "Content-Type: multipart/form-data" \
+              -F file="@ai_start.mp3" \
+              -F "timestamp_granularities[]=segment" \
+              -F model="whisper-1" \
+              -F response_format="verbose_json" \
+              > ai_start_transcript.json
+
+            curl -sS --fail https://api.openai.com/v1/audio/transcriptions \
+              -H "Authorization: Bearer $OPENAI_API_KEY" \
+              -H "Content-Type: multipart/form-data" \
+              -F file="@ai_end.mp3" \
+              -F "timestamp_granularities[]=segment" \
+              -F model="whisper-1" \
+              -F response_format="verbose_json" \
+              > ai_end_transcript.json
+
+            python3 - "$DURATION" "$END_OFFSET" <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          duration = float(sys.argv[1])
+          end_offset = float(sys.argv[2])
+          api_key = os.environ["OPENAI_API_KEY"]
+
+          def load_segments(path, offset=0.0):
+              with open(path, "r", encoding="utf-8") as f:
+                  data = json.load(f)
+              lines = []
+              for seg in data.get("segments", []):
+                  start = float(seg.get("start", 0)) + offset
+                  end = float(seg.get("end", 0)) + offset
+                  text = " ".join(str(seg.get("text", "")).split())
+                  if text:
+                      lines.append(f"{start:.2f}-{end:.2f}: {text}")
+              return "\n".join(lines)
+
+          start_text = load_segments("ai_start_transcript.json")[:18000]
+          end_text = load_segments("ai_end_transcript.json", end_offset)[:18000]
+
+          messages = [
+              {
+                  "role": "system",
+                  "content": (
+                      "Eres un editor de video de clases en espanol. Devuelve solo JSON valido. "
+                      "Debes detectar el inicio real y el final real de una clase a partir de segmentos transcritos con timestamps en segundos."
+                  ),
+              },
+              {
+                  "role": "user",
+                  "content": (
+                      f"Duracion total del video: {duration:.2f} segundos.\n\n"
+                      "Objetivo de inicio: conservar desde cuando empieza la presentacion formal del profesor, "
+                      "la introduccion real de la clase o el contenido docente. Excluye esperas, pruebas tecnicas, "
+                      "silencios y charla casual previa. Si no esta claro, usa null.\n\n"
+                      "Objetivo de final: conservar hasta justo despues del cierre real de la clase, por ejemplo frases "
+                      "como 'damos por finalizada', 'hasta aqui', 'nos vemos en la proxima', despedida final o cierre equivalente. "
+                      "Excluye charla posterior, silencios y pruebas. Si no esta claro, usa null.\n\n"
+                      "Devuelve este JSON exacto con numeros en segundos o null:\n"
+                      "{\"trim_start\": number|null, \"trim_end\": number|null, "
+                      "\"confidence_start\": number, \"confidence_end\": number, \"reason\": string}\n\n"
+                      "Segmentos del principio:\n"
+                      f"{start_text}\n\n"
+                      "Segmentos del final:\n"
+                      f"{end_text}"
+                  ),
+              },
+          ]
+
+          payload = {
+              "model": "gpt-4o-mini",
+              "temperature": 0,
+              "response_format": {"type": "json_object"},
+              "messages": messages,
+          }
+          req = urllib.request.Request(
+              "https://api.openai.com/v1/chat/completions",
+              data=json.dumps(payload).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=120) as resp:
+                  response = json.load(resp)
+          except urllib.error.HTTPError as exc:
+              sys.stderr.write(exc.read().decode("utf-8", errors="replace"))
+              raise
+
+          content = response["choices"][0]["message"]["content"]
+          decision = json.loads(content)
+          start = decision.get("trim_start")
+          end = decision.get("trim_end")
+          conf_start = float(decision.get("confidence_start") or 0)
+          conf_end = float(decision.get("confidence_end") or 0)
+
+          def usable_number(value):
+              return isinstance(value, (int, float)) and value == value
+
+          if not usable_number(start) or conf_start < 0.55 or start < 0 or start > duration - 60:
+              start = None
+          else:
+              start = max(0, float(start) - 3)
+
+          if not usable_number(end) or conf_end < 0.55 or end <= 60 or end > duration:
+              end = None
+          else:
+              end = min(duration, float(end) + 5)
+
+          if start is not None and end is not None and end <= start + 60:
+              end = None
+
+          with open("ai_trim.env", "w", encoding="utf-8") as f:
+              if start is not None:
+                  f.write(f"AI_TRIM_START={start:.3f}\n")
+              if end is not None:
+                  f.write(f"AI_TRIM_END={end:.3f}\n")
+
+          with open("ai_trim_decision.json", "w", encoding="utf-8") as f:
+              json.dump(decision, f, ensure_ascii=True, indent=2)
+
+          print(json.dumps(decision, ensure_ascii=True))
+          PY
+          }
+
+          if [ "${AUTO_TRIM,,}" = "true" ] && { [ -z "$FINAL_START" ] || [ -z "$FINAL_END" ]; }; then
+            if [ -n "$OPENAI_API_KEY" ]; then
+              set +e
+              ( detect_ai_trim )
+              AI_RC=$?
+              set -e
+              if [ "$AI_RC" -eq 0 ] && [ -s ai_trim.env ]; then
+                . ./ai_trim.env
+                FINAL_START="${FINAL_START:-${AI_TRIM_START:-}}"
+                FINAL_END="${FINAL_END:-${AI_TRIM_END:-}}"
+              else
+                echo "AI trim detection failed or returned no usable timestamps; continuing without AI trim."
+              fi
+            else
+              echo "OPENAI_API_KEY is not configured; skipping AI trim detection."
+            fi
+          fi
+
+          python3 - "$DURATION" "$FINAL_START" "$FINAL_END" <<'PY' > trim.env
+          import sys
+
+          duration = float(sys.argv[1])
+          raw_start = sys.argv[2].strip()
+          raw_end = sys.argv[3].strip()
+
+          def parse_time(value):
+              if not value:
+                  return None
+              if ":" not in value:
+                  return float(value)
+              parts = [float(part) for part in value.split(":")]
+              seconds = 0.0
+              for part in parts:
+                  seconds = seconds * 60 + part
+              return seconds
+
+          try:
+              start = parse_time(raw_start)
+              end = parse_time(raw_end)
+          except Exception:
+              print("SHOULD_TRIM=false")
+              raise SystemExit(0)
+
+          if start is None:
+              start = 0.0
+          start = max(0.0, min(start, duration))
+
+          if end is not None:
+              end = max(0.0, min(end, duration))
+              if end <= start + 10:
+                  print("SHOULD_TRIM=false")
+                  raise SystemExit(0)
+
+          should_trim = start > 0.1 or end is not None
+          print(f"SHOULD_TRIM={'true' if should_trim else 'false'}")
+          print(f"TRIM_START_SECONDS={start:.3f}")
+          if end is not None:
+              print(f"TRIM_DURATION_SECONDS={end - start:.3f}")
+              print(f"TRIM_END_SECONDS={end:.3f}")
+          PY
+
+          . ./trim.env
+          if [ "$SHOULD_TRIM" != "true" ]; then
+            echo "No main-video trim applied."
+            exit 0
+          fi
+
+          echo "Trimming main video from ${TRIM_START_SECONDS}s${TRIM_END_SECONDS:+ to ${TRIM_END_SECONDS}s}."
+          FFMPEG_ARGS=(-hide_banner -loglevel error -y -ss "$TRIM_START_SECONDS" -i in/input)
+          if [ -n "${TRIM_DURATION_SECONDS:-}" ]; then
+            FFMPEG_ARGS+=(-t "$TRIM_DURATION_SECONDS")
+          fi
+          FFMPEG_ARGS+=(-map 0:v:0 -map "0:a:0?" -c copy -avoid_negative_ts make_zero in/input_trimmed.mp4)
+          ffmpeg "${FFMPEG_ARGS[@]}"
+          mv in/input in/input_original
+          mv in/input_trimmed.mp4 in/input
 
       - name: Probe main video parameters
         id: probe
