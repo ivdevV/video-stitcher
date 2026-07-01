@@ -197,14 +197,27 @@ jobs:
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
           DST_ID: ${{ secrets.DRIVE_DST_ID }}
+          TEAM_DRIVE_ID: ${{ secrets.DRIVE_TEAM_DRIVE_ID }}
         run: |
           set -e
           OUT="${{ inputs.output_basename }}.mp4"
 
           CONF="$RCLONE_CONFIG"
-          if [ -n "$DST_ID" ]; then
+          if [ -n "$DST_ID" ] || [ -n "$TEAM_DRIVE_ID" ]; then
             cp "$RCLONE_CONFIG" rclone.dst.conf
-            echo "root_folder_id = $DST_ID" >> rclone.dst.conf
+
+            if [ -n "$TEAM_DRIVE_ID" ]; then
+              echo "team_drive = $TEAM_DRIVE_ID" >> rclone.dst.conf
+              if [ -n "$DST_ID" ]; then
+                echo "root_folder_id = $DST_ID" >> rclone.dst.conf
+              fi
+            else
+              case "$DST_ID" in
+                0A*) echo "team_drive = $DST_ID" >> rclone.dst.conf ;;
+                *) echo "root_folder_id = $DST_ID" >> rclone.dst.conf ;;
+              esac
+            fi
+
             CONF="$(pwd)/rclone.dst.conf"
           fi
 
@@ -226,7 +239,7 @@ jobs:
               tail -n 50 "$LOG" || true
               echo "--------------------------------"
               if grep -q "HTTP response code 429" "$LOG"; then
-                return 429
+                return 75
               fi
               return $RC
             fi
@@ -238,9 +251,10 @@ jobs:
             if try_upload; then
               echo "Uploaded: ${OUT}"
               exit 0
+            else
+              ERR=$?
             fi
-            ERR=$?
-            if [ "$ERR" = "429" ]; then
+            if [ "$ERR" = "75" ]; then
               S=$((i*30))
               echo "429 detected. Sleeping ${S}s before retry..."
               sleep $S
